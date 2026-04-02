@@ -82,16 +82,16 @@ def add_mask_width_ESP(img_array):
 
 ################################################################################
 def build_masks(tile, for_imagery=False):
-    
+
     if UI.is_working:
         return 0
     UI.is_working = 1
-    
+
     # Which grey level for inland water equivalent ?
     im = Image.open(os.path.join(FNAMES.Utils_dir, "water_transition.png"))
     sea_level = im.getpixel((0, 127 * (1 - min(1, 0.1 + tile.ratio_water))))
     del im
-    
+
     UI.red_flag = False
     UI.logprint(
         "Step 2.5 for tile lat=", tile.lat, ", lon=", tile.lon, ": starting."
@@ -104,7 +104,7 @@ def build_masks(tile, for_imagery=False):
     )
 
     timer = time.time()
-    
+
     # Check we have a mesh for this tile
     if not os.path.exists(FNAMES.mesh_file(tile.build_dir, tile.lat, tile.lon)):
         UI.lvprint(
@@ -115,8 +115,8 @@ def build_masks(tile, for_imagery=False):
         )
         UI.exit_message_and_bottom_line("")
         return 0
-    
-    # Check or create dest dir 
+
+    # Check or create dest dir
     dest_dir = (
         FNAMES.mask_dir(tile.lat, tile.lon)
         if not for_imagery
@@ -126,14 +126,14 @@ def build_masks(tile, for_imagery=False):
     )
     if not os.path.exists(dest_dir):
         os.makedirs(dest_dir)
-    
+
     # Select nearby meshes
     mesh_list = select_neighbor_meshes(tile)
 
     # Delete old masks
     UI.vprint(1, "-> Deleting existing masks")
     delete_old_masks_in_tile(tile, dest_dir)
-    
+
     # Record water tris form mesh (and portions of nearby meshes)
     UI.vprint(1, "-> Reading mesh data")
     (dico_sea, dico_inland) = record_water_tris(tile, )
@@ -163,12 +163,12 @@ def build_masks(tile, for_imagery=False):
             tile.lat + 1, tile.lon, tile.mask_zl)
         (til_x_max, til_y_max) = GEO.wgs84_to_orthogrid(
             tile.lat, tile.lon + 1, tile.mask_zl)
-        if (til_x < til_x_min or til_x > til_x_max or til_y < til_y_min or 
+        if (til_x < til_x_min or til_x > til_x_max or til_y < til_y_min or
             til_y > til_y_max):
             return 1
 
         pre_mask = build_water_pre_mask(til_x, til_y, mesh_list, dico_sea,
-                                         dico_inland, sea_level, tile) 
+                                         dico_inland, sea_level, tile)
         if tile.masks_use_DEM_too:
             dem_array = build_dem_pre_mask(til_x, til_y, tile)
             pre_mask = numpy.maximum(pre_mask, dem_array)
@@ -180,17 +180,17 @@ def build_masks(tile, for_imagery=False):
         if (pre_mask.max() == 0) and (
                 not tile.masks_custom_extent or custom_array.max() == 0):
             return 1
-        
-        
+
+
         blured_mask = blur_mask(pre_mask, tile, sea_level)
 
-        # Ensure land is kept to 255 on the mask to avoid unecessary ones, crop 
+        # Ensure land is kept to 255 on the mask to avoid unecessary ones, crop
         # to final size, and take the max with the possible custom extent mask
         blured_mask = numpy.maximum(
-            (pre_mask > 0).astype(numpy.uint8) * 255, 
+            (pre_mask > 0).astype(numpy.uint8) * 255,
             blured_mask
         )[1024 : 4096 + 1024, 1024 : 4096 + 1024]
-        
+
         if tile.masks_custom_extent:
             blured_mask = numpy.maximum(blured_mask, custom_mask)
 
@@ -200,10 +200,8 @@ def build_masks(tile, for_imagery=False):
                 name, extension = os.path.splitext(mask_img_name)
                 mask_img_name = name + ".tif"
                 mode = "RGBA"
-                img_array = add_mask_width_ESP(img_array)
-
-                masks_im=Image.fromarray(img_array, mode=mode)  #.filter(ImageFilter.GaussianBlur(3))
-                mask_im = masks_im.convert("RGB")
+                img_array = add_mask_width_ESP(blured_mask)
+                masks_im = Image.fromarray(img_array, mode=mode)
                 masks_im.save(mask_img_name)
                 del blured_mask
                 UI.vprint(1, "   Created", mask_img_name)
@@ -212,7 +210,7 @@ def build_masks(tile, for_imagery=False):
                 mask_im.save(os.path.join(
                     dest_dir, FNAMES.legacy_mask(til_x, til_y)))
                 del blured_mask
-                
+
                 # Distance masks for bathymetry cut-off
                 if (tile.distance_masks_too):
                     pre_mask = (pre_mask > 0).astype(float) * 2 - 1
@@ -235,7 +233,7 @@ def build_masks(tile, for_imagery=False):
                     UI.vprint(1, "   Created", FNAMES.legacy_mask(til_x, til_y))
         return 1
     #################################
-    
+
     masks_queue = queue.Queue()
     for key in dico_sea:
         masks_queue.put(key)
@@ -251,7 +249,7 @@ def build_masks(tile, for_imagery=False):
     )
     return
 ################################################################################
-    
+
 ################################################################################
 def select_neighbor_meshes(tile):
     mesh_list = []
@@ -288,7 +286,7 @@ def delete_old_masks_in_tile(tile, dest_dir):
             except:
                 pass
 ################################################################################
-    
+
 ################################################################################
 def build_water_pre_mask(til_x, til_y, mesh_list, dico_sea, dico_inland,
                          sea_level, tile):
@@ -299,7 +297,7 @@ def build_water_pre_mask(til_x, til_y, mesh_list, dico_sea, dico_inland,
     # 1) We start with a black mask
     mask_im = Image.new("L", (4096 + 2 * 1024, 4096 + 2 * 1024), "black")
     mask_draw = ImageDraw.Draw(mask_im)
-    # 2) We fill it with white over the extent of each tile around for 
+    # 2) We fill it with white over the extent of each tile around for
     # which we had a mesh available
     for mesh_file_name in mesh_list:
         latlonstr = mesh_file_name.split(".mes")[-2][-7:]
@@ -322,7 +320,7 @@ def build_water_pre_mask(til_x, til_y, mesh_list, dico_sea, dico_inland,
         mask_draw.polygon(
             [(px1, py1), (px2, py2), (px3, py3), (px4, py4)], fill="white"
         )
-    # 3a)  We overwrite the white part of the mask with grey (ratio_water 
+    # 3a)  We overwrite the white part of the mask with grey (ratio_water
     # dependent) where inland water was detected in the first part above
     if (til_x, til_y) in dico_inland:
         for (lat1, lon1, lat2, lon2, lat3, lon3) in dico_inland[
@@ -340,7 +338,7 @@ def build_water_pre_mask(til_x, til_y, mesh_list, dico_sea, dico_inland,
             mask_draw.polygon(
                 [(px1, py1), (px2, py2), (px3, py3)], fill=sea_level
             )  # int(255*(1-tile.ratio_water)))
-    # 3b) We overwrite the white + grey part of the mask with black where 
+    # 3b) We overwrite the white + grey part of the mask with black where
     # sea water was detected in the first part above
     for (lat1, lon1, lat2, lon2, lat3, lon3) in dico_sea[(til_x, til_y)]:
         (px1, py1) = GEO.wgs84_to_pix(lat1, lon1, tile.mask_zl)
@@ -451,16 +449,6 @@ def record_water_tris(tile):
     [til_x_max, til_y_max] = GEO.wgs84_to_orthogrid(
         tile.lat, tile.lon + 1, tile.mask_zl
     )
-    if not O4_ESP_Globals.build_for_ESP:
-        UI.vprint(1, "-> Deleting existing masks")
-        for til_x in range(til_x_min, til_x_max + 1, 16):
-            for til_y in range(til_y_min, til_y_max + 1, 16):
-                try:
-                    os.remove(
-                        os.path.join(dest_dir, FNAMES.legacy_mask(til_x, til_y))
-                    )
-                except:
-                    pass
     UI.vprint(1, "-> Reading mesh data")
     for mesh_file_name in mesh_list:
         try:
@@ -662,7 +650,7 @@ def record_water_tris(tile):
                 )
                 a = (til_x2 // 16) % 4
                 b = (til_y2 // 16) % 4
-                # Here an inland water tri is added ONLY if sea water tri were 
+                # Here an inland water tri is added ONLY if sea water tri were
                 # already added for this mask extent
                 if (til_x, til_y) in dico_sea:
                     if (til_x, til_y) in dico_inland:
@@ -674,10 +662,10 @@ def record_water_tris(tile):
                             (lat1, lon1, lat2, lon2, lat3, lon3)
                         ]
             f_mesh.close()
-    
+
     return (dico_sea, dico_inland)
 ################################################################################
-        
+
 ################################################################################
 def blur_mask(img_array, tile, sea_level):
     ##########################################
@@ -731,7 +719,7 @@ def blur_mask(img_array, tile, sea_level):
             .filter(ImageFilter.GaussianBlur(blur_width)),
             dtype=numpy.uint8,
         )
-        # nonlinear transform to make the transition quicker at the shore 
+        # nonlinear transform to make the transition quicker at the shore
         # (gaussian is too flat)
         gamma = 2.5
         b_img_array = (
@@ -830,7 +818,7 @@ def blur_mask(img_array, tile, sea_level):
             ).astype(numpy.uint8) * 255
             b_img_array[(b_img_array == 0) * (b_mask_array != 0)] = value
             UI.vprint(2, value)
-        # To smoothen the thresolding introduced above we do a global short 
+        # To smoothen the thresolding introduced above we do a global short
         # extent gaussian blur
         b_img_array = numpy.array(
             Image.fromarray(b_img_array)

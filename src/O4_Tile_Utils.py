@@ -151,6 +151,10 @@ def build_tile(tile):
         UI.exit_message_and_bottom_line("")
         return 0
 
+
+    if O4_ESP_Globals.build_for_ESP:
+        O4_ESP_Globals.mask_dir = FNAMES.mask_dir(tile.lat, tile.lon)
+
     try:
         if not os.path.exists(
             os.path.join(

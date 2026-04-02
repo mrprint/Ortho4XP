@@ -224,7 +224,7 @@ def worker(queue):
         try:
             file_name = args[0]
             inf_abs_path = args[1]
-            img_mask_abs_path = args[2]
+            img_mask_abs_path = args[2] if args[2] else None
 
             # we create the night and seasonal textures at resample time, and delete them right after...
             # why? to not require a ridiculously large amount of storage space...
@@ -278,7 +278,7 @@ def build_for_ESP(build_dir, tile):
         print("ESP_build_dir is None inside of resample... something went wrong, so can't run resample")
         return
 
-    if O4_Config_Utils.ESP_resample_loc is '':
+    if O4_Config_Utils.ESP_resample_loc == '':
         print("No resample.exe is specified in Ortho4XP.cfg, quitting")
         return
     if not os.path.isfile(O4_Config_Utils.ESP_resample_loc):
@@ -290,7 +290,9 @@ def build_for_ESP(build_dir, tile):
     scenproc_thread = None
     q2 = None
     if os.path.isfile(O4_Config_Utils.ESP_scenproc_loc) and os.path.exists(scenproc_osm_directory):
-        scenproc_script_file = os.path.abspath(FNAMES.scenproc_script_file(O4_Config_Utils.ESP_scenproc_script))
+        scenproc_script_file = os.path.abspath(
+            os.path.join(FNAMES.ScenProc_configs_dir, O4_Config_Utils.ESP_scenproc_script)
+        )
         addon_scenery_folder = os.path.abspath(os.path.join(build_dir, "ADDON_SCENERY"))
         texture_folder = os.path.abspath(os.path.join(addon_scenery_folder, "texture"))
         # in case resample threads haven't created ADDON_SCENERY folder yet
@@ -311,7 +313,7 @@ def build_for_ESP(build_dir, tile):
             for full_file_name in file_names:
                 scenproc_osm_file_name = os.path.abspath(os.path.join(scenproc_osm_directory, full_file_name))
                 q2.put_nowait([scenproc_script_file, scenproc_osm_file_name, texture_folder])
-        
+
     # call resample on each individual file, to avoid file name too long errors with subprocess
     # https://stackoverflow.com/questions/2381241/what-is-the-subprocess-popen-max-length-of-the-args-parameter
     # passing shell=True to subprocess didn't help with this error when there are a large amount of inf files to process
@@ -336,11 +338,11 @@ def build_for_ESP(build_dir, tile):
                 img_mask_abs_path = os.path.abspath(os.path.join(img_mask_folder_abs_path, img_mask_name))
                 should_mask = (O4_ESP_Globals.do_build_masks and os.path.isfile(img_mask_abs_path))
                 if not should_mask:
-                    img_mask_abs_path = None
+                    img_mask_abs_path = ""
 
                 # subprocess.call([O4_Config_Utils.ESP_resample_loc, inf_abs_path])
                 q.put_nowait([file_name, inf_abs_path, img_mask_abs_path])
-    
+
     for _ in threads: q.put_nowait(None) # signal no more files
     if scenproc_thread is not None:
         q2.put_nowait(None)

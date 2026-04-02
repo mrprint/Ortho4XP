@@ -169,7 +169,7 @@ def build_poly_file(tile):
             vector_map.seeds["SEA"] = [numpy.array([1000, 1000])]
         else:
             vector_map.seeds["SEA"] = [numpy.array([0.5, 0.5])]
-    vector_map.snap_to_grid(9) 
+    vector_map.snap_to_grid(9)
     vector_map.write_node_file(node_file)
     vector_map.write_poly_file(poly_file)
 
@@ -191,40 +191,45 @@ def include_scenproc(tile):
     if not os.path.exists(scenproc_osm_dir):
         os.mkdir(scenproc_osm_dir)
 
-    min_lon = tile.lon
-    max_lon = tile.lon
-    min_lat = tile.lat
-    max_lat = tile.lat
-    buildings_and_trees_tags = ["way[\"natural\"]", "way[\"landuse\"]", "way[\"leisure\"]", "way[\"building\"]",
-                              "rel[\"natural\"]", "rel[\"landuse\"]", "rel[\"leisure\"]", "rel[\"building\"]"]
-
     OFFSET = 0.5
-    i, j = 0, 0
+    buildings_and_trees_tags = (
+        'way["natural"]',
+        'way["landuse"]',
+        'way["leisure"]',
+        'way["building"]',
+        'rel["natural"]',
+        'rel["landuse"]',
+        'rel["leisure"]',
+        'rel["building"]',
+    )
 
-    while max_lon < (tile.lon + 1):
-        max_lon += OFFSET
-        if max_lon > (tile.lon + 1):
-            max_lon = tile.lon + 1
+    i = 0
+    min_lon = tile.lon
+    while min_lon < tile.lon + 1:
+        max_lon = min(min_lon + OFFSET, tile.lon + 1)
+        j = 0
+        min_lat = tile.lat
+        while min_lat < tile.lat + 1:
+            max_lat = min(min_lat + OFFSET, tile.lat + 1)
 
-        while max_lat < (tile.lat + 1):
-            max_lat += OFFSET
-            if max_lat > (tile.lat + 1):
-                max_lat = tile.lat + 1
-
-            print("Attempting to download OSM data from " + str(min_lat) + ", " + str(min_lon) + " to " + str(max_lat) + ", " + str(max_lon))
-            response = OSM.get_overpass_data("", (min_lon, min_lat, max_lon, max_lat), "MAP")
-            file_name = os.path.join(scenproc_osm_dir, "scenproc_osm_data" + str(i) + "_" + str (j) + ".osm")
-            with open(file_name, "wb") as f:
-                f.write(response)
+            bbox = (min_lat, min_lon, max_lat, max_lon)
+            print(f"Attempting to download OSM data from {min_lat}, {min_lon} to {max_lat}, {max_lon}")
+            response = OSM.get_overpass_data(buildings_and_trees_tags, bbox)
+            if response:
+                file_name = os.path.join(
+                    scenproc_osm_dir,
+                    f"scenproc_osm_data{i}_{j}.osm"
+                )
+                with open(file_name, "wb") as f:
+                    f.write(response)
+                print("Download successful")
+            else:
+                print(f"Warning: failed to download OSM data for bbox {bbox}, skipping.")
 
             min_lat = max_lat
             j += 1
-            print("Download successful")
 
         min_lon = max_lon
-        min_lat = tile.lat
-        max_lat = tile.lat
-        j = 0
         i += 1
 
 ##############################################################################
