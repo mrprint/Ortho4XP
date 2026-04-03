@@ -15,10 +15,7 @@ Work in progress at adding FSX/P3D (ESP support)
 
 2) Please also install Microsoft Visual c++ redistributable. Download it here: https://aka.ms/vs/16/release/vc_redist.x64.exe
 
-3) Please install ImageMagick before attempting to run, otherwise the night/season creation won't work. An installer has been provided inside the dist/ directory. Run the installer with the default settings.
-The same installer can also be found here: https://www.imagemagick.org/download/binaries/ImageMagick-7.0.8-10-Q8-x64-dll.exe
-
-4) NOTE: Need to provide the location of your resample.exe from the P3D or FSX SDK in Ortho4XP.cfg, like this:
+3) NOTE: Need to provide the location of your resample.exe from the P3D or FSX SDK in Ortho4XP.cfg, like this:
 
 `ESP_resample_loc=C:\\LOCATION\\TO\\resample.exe`
 
@@ -65,17 +62,6 @@ Then, copy spatialindex-64.dll and spatialindex_c-64.dll (from rtree python modu
 If the executable crashes with errors like `OSError: could not find or load spatialindex_c-64.dll`, then follow these instructions: https://stackoverflow.com/questions/64398516/pyinstaller-exe-oserror-could-not-find-or-load-spatialindex-c-64-dll
 
 (Basically, find the `Ortho4XP_v130.spec` file, which should be in the same directory as Ortho4XP_v130.py. Add this import to it: `from PyInstaller.utils.hooks import collect_dynamic_libs`. Then, change the line that says `binaries=[]` to `binaries=collect_dynamic_libs("rtree")`. A sample `Ortho4XP_v130.spec` file is provided for reference, but it is recommended to use the one produced by pyinstaller and edit it with the lines just mentioned. After doing this, run `pyinstaller Ortho4XP_v130.spec`).
-
-To build the imagemagick based c++ dll, use the Visual Studio Native Tools Command Prompt, and do something like:
-
-`"F:\ExtraPrograms\Microsoft Visual Studio\2017\Community\VC\Tools\MSVC\14.14.26428\bin\Hostx64\x64\cl.exe" /LD /I "C:\Program Files\ImageMagick-7.0.8-Q8\include" /I C:/Users/fery2/AppData/Local/Programs/Python/Python36/include src\cpp\fast_image_mask.cpp src\cpp\FSET_ports.cpp  C:\Users\fery2\AppData\Local\Programs\Python\Python36\libs\python36.lib "C:\Program Files\ImageMagick-7.0.8-Q8\lib\CORE_RL_Magick++_.lib" "C:\Program Files\ImageMagick-7.0.8-Q8\lib\CORE_RL_MagickCore_.lib" "C:\Program Files\ImageMagick-7.0.8-Q8\lib\CORE_RL_MagickWand_.lib"`
-
-Make sure the visual ++ environment is set to the correct bit of your python (32 vs 64 bit), and rename the .dll to .pyd
-
-Note:
-Imagemagick is required, specifically the q8 quantum depth version. To build it on UNIX from source code, configure like this:
-
-`./configure --with-tiff=yes --with-quantum-depth=8`
 
 # WHERE TO FIND the .bgl FILES FOR FSX
 Ortho4XP generates a bunch of .bgl files for each tile inside the `Orthophotos` directory (for instance: `Ortho4XP_FSX_P3D-master\Orthophotos\+30+000\+39+002\BI_16\ADDON_SCENERY`). Rename the `ADDON_SCENERY` folder to whatever you wish, and move it wherever you wish (recommended is inside the `Addons Scenery` folder inside FSX/P3D). Then, add the scenery using the add/remove scenery option inside of the sim
