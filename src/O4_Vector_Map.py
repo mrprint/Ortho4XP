@@ -1,5 +1,6 @@
 import os
 import time
+import asyncio
 from math import pi, sin, cos, sqrt, atan, exp
 import numpy
 from shapely import geometry, ops
@@ -14,6 +15,12 @@ import O4_Geo_Utils as GEO
 import O4_Airport_Utils as APT
 import O4_ESP_Globals
 import O4_Config_Utils
+
+try:
+    import httpx
+    _has_httpx = True
+except ImportError:
+    _has_httpx = False
 
 good_imagery_list = ()
 
@@ -112,11 +119,9 @@ def build_poly_file(tile):
     for til_x in range(til_xul + 16, til_xlr + 1, 16):
         pos_x = til_x / (2 ** (tile.mesh_zl - 1)) - 1
         xgrid.add(pos_x * 180 - tile.lon)
-        #print("x", pos_x * 180 - tile.lon)
     for til_y in range(til_yul + 16, til_ylr + 1, 16):
         pos_y = 1 - (til_y) / (2 ** (tile.mesh_zl - 1))
         ygrid.add(360 / pi * atan(exp(pi * pos_y)) - 90 - tile.lat)
-        #print("y", (360 / pi * atan(exp(pi * pos_y)) - 90 - tile.lat))
 
     xgrid.add(0)
     xgrid.add(1)
@@ -184,14 +189,222 @@ def build_poly_file(tile):
 ##############################################################################
 
 ##############################################################################
-def include_scenproc(tile):
-    print("Downloading OSM data for ScenProc, this might take some time, please wait...")
-    print("If OSM server rejects our request due to too many requests, will keep trying until successful.")
-    scenproc_osm_dir = os.path.join(FNAMES.osm_dir(tile.lat, tile.lon), "scenproc_osm_data")
-    if not os.path.exists(scenproc_osm_dir):
-        os.mkdir(scenproc_osm_dir)
+# Overpass sub-bbox size for ScenProc downloads (degrees).
+# Smaller values → more parallel requests, lower per-request data volume,
+# less risk of hitting the Overpass memory limit.
+_SCENPROC_BBOX_STEP = 0.5
 
-    OFFSET = 0.5
+# How many times to retry an empty or failed response per sub-bbox.
+_SCENPROC_MAX_RETRIES = 8
+
+
+async def _fetch_scenproc_bbox(
+    client: "httpx.AsyncClient",
+    queries: tuple,
+    bbox: tuple,
+    out_path: str,
+    semaphore: asyncio.Semaphore,
+) -> bool:
+    """
+    Download one sub-bbox from Overpass and write it to *out_path*.
+
+    Retries up to _SCENPROC_MAX_RETRIES times on:
+      • network errors
+      • HTTP 5xx
+      • empty-but-valid responses (no <node>/<way>/<relation>)
+
+    Returns True on success, False if all retries are exhausted.
+    """
+    if isinstance(queries, str):
+        overpass_query = queries + str(bbox) + ";"
+    else:
+        overpass_query = "".join(q + str(bbox) + ";" for q in queries)
+
+    servers = list(OSM.overpass_servers.values())
+    tentative = 0
+
+    while tentative < _SCENPROC_MAX_RETRIES:
+        base_url = servers[tentative % len(servers)]
+        url = base_url + "?data=(" + overpass_query + ");(._;>>;);out meta;"
+        try:
+            async with semaphore:
+                resp = await client.get(url)
+
+            if resp.status_code == 200:
+                content = resp.content
+                if b"</osm>" not in content[-10:] and b"</OSM>" not in content[-10:]:
+                    UI.vprint(2, f"    ScenProc OSM: corrupted reply for {bbox}, retrying...")
+                elif OSM._is_empty_osm(content):
+                    # Server was busy, returned metadata-only response.
+                    UI.vprint(
+                        1,
+                        f"    ScenProc OSM: empty response for {bbox} "
+                        f"(attempt {tentative + 1}/{_SCENPROC_MAX_RETRIES}), retrying...",
+                    )
+                else:
+                    # Good data — write to file.
+                    with open(out_path, "wb") as f:
+                        f.write(content)
+                    UI.vprint(2, f"    ScenProc OSM: saved {out_path}")
+                    return True
+
+            elif resp.status_code in (400, 404):
+                UI.vprint(1, f"    ScenProc OSM: server rejected query for {bbox} ({resp.status_code})")
+                return False    # non-retriable
+            else:
+                UI.vprint(1, f"    ScenProc OSM: HTTP {resp.status_code} for {bbox}, retrying...")
+
+        except Exception as exc:
+            UI.vprint(1, f"    ScenProc OSM: error for {bbox}: {exc}, retrying...")
+
+        tentative += 1
+        if tentative < _SCENPROC_MAX_RETRIES:
+            await asyncio.sleep(2 ** tentative)
+
+    UI.vprint(
+        1,
+        f"    ScenProc OSM: giving up on {bbox} after "
+        f"{_SCENPROC_MAX_RETRIES} attempts.",
+    )
+    return False
+
+
+async def _download_all_scenproc_bboxes(
+    queries: tuple,
+    tile_lat: float,
+    tile_lon: float,
+    out_dir: str,
+) -> int:
+    """
+    Download OSM data for all sub-bboxes covering the tile in parallel.
+
+    Returns the number of successfully downloaded files.
+    """
+    # Build list of (bbox, out_path) pairs.
+    jobs: list[tuple[tuple, str]] = []
+    step = _SCENPROC_BBOX_STEP
+    i = 0
+    min_lon = tile_lon
+    while min_lon < tile_lon + 1:
+        max_lon = min(min_lon + step, tile_lon + 1)
+        j = 0
+        min_lat = tile_lat
+        while min_lat < tile_lat + 1:
+            max_lat = min(min_lat + step, tile_lat + 1)
+            bbox = (min_lat, min_lon, max_lat, max_lon)
+            out_path = os.path.join(out_dir, f"scenproc_osm_data{i}_{j}.osm")
+            jobs.append((bbox, out_path))
+            min_lat = max_lat
+            j += 1
+        min_lon = max_lon
+        i += 1
+
+    # Limit concurrency: at most 4 simultaneous connections to Overpass.
+    # More than ~4 tends to trigger rate-limiting on public servers.
+    semaphore = asyncio.Semaphore(4)
+
+    async with httpx.AsyncClient(
+        http2=True,
+        timeout=60.0,
+        follow_redirects=True,
+        trust_env=False,
+    ) as client:
+        tasks = [
+            _fetch_scenproc_bbox(client, queries, bbox, out_path, semaphore)
+            for bbox, out_path in jobs
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=False)
+
+    ok = sum(1 for r in results if r)
+    UI.vprint(1, f"    ScenProc OSM: {ok}/{len(jobs)} sub-bboxes downloaded successfully.")
+    return ok
+
+
+def include_scenproc(tile) -> None:
+    """
+    Download OSM data required by ScenProc for the given tile.
+
+    Changes vs. the original implementation
+    ────────────────────────────────────────
+    • All sub-bbox requests are fired concurrently (asyncio + httpx HTTP/2)
+      instead of sequentially, reducing wall-clock time roughly proportional
+      to the number of sub-bboxes (4 for a default 1°×1° tile with step=0.5°).
+    • Empty-but-valid Overpass responses (metadata only, no map elements) are
+      detected and retried automatically up to _SCENPROC_MAX_RETRIES times.
+    • Files are written only after a successful, non-empty response, so the
+      scenproc_osm_data directory never contains stale placeholder files from
+      a previous failed run.
+    • Falls back gracefully to the old sequential requests path when httpx is
+      not available.
+    """
+    if not _has_httpx:
+        # Graceful degradation: run the original synchronous code path.
+        _include_scenproc_sync_fallback(tile)
+        return
+
+    print(
+        "Downloading OSM data for ScenProc using HTTP/2 parallel requests..."
+    )
+
+    scenproc_osm_dir = os.path.join(
+        FNAMES.osm_dir(tile.lat, tile.lon), "scenproc_osm_data"
+    )
+    os.makedirs(scenproc_osm_dir, exist_ok=True)
+
+    # Delete any stale files from a previous (possibly failed) run so that
+    # build_for_ESP does not process empty OSM files.
+    for fname in os.listdir(scenproc_osm_dir):
+        if fname.endswith(".osm"):
+            fpath = os.path.join(scenproc_osm_dir, fname)
+            try:
+                with open(fpath, "rb") as f:
+                    content = f.read()
+                if OSM._is_empty_osm(content):
+                    os.remove(fpath)
+                    UI.vprint(
+                        1,
+                        f"    ScenProc OSM: removed stale empty file {fname}",
+                    )
+            except OSError:
+                pass
+
+    queries = (
+        'way["natural"]',
+        'way["landuse"]',
+        'way["leisure"]',
+        'way["building"]',
+        'rel["natural"]',
+        'rel["landuse"]',
+        'rel["leisure"]',
+        'rel["building"]',
+    )
+
+    # asyncio.run works correctly when called from a worker thread
+    # (which is always the case here — build_poly_file runs in a Thread).
+    asyncio.run(
+        _download_all_scenproc_bboxes(
+            queries,
+            tile.lat,
+            tile.lon,
+            scenproc_osm_dir,
+        )
+    )
+
+
+def _include_scenproc_sync_fallback(tile) -> None:
+    """
+    Original sequential implementation kept as a fallback when httpx is absent.
+    Detects and skips empty Overpass responses.
+    """
+    print(
+        "Downloading OSM data for ScenProc (sequential fallback, no httpx)..."
+    )
+    scenproc_osm_dir = os.path.join(
+        FNAMES.osm_dir(tile.lat, tile.lon), "scenproc_osm_data"
+    )
+    os.makedirs(scenproc_osm_dir, exist_ok=True)
+
+    OFFSET = _SCENPROC_BBOX_STEP
     buildings_and_trees_tags = (
         'way["natural"]',
         'way["landuse"]',
@@ -211,24 +424,30 @@ def include_scenproc(tile):
         min_lat = tile.lat
         while min_lat < tile.lat + 1:
             max_lat = min(min_lat + OFFSET, tile.lat + 1)
-
             bbox = (min_lat, min_lon, max_lat, max_lon)
-            print(f"Attempting to download OSM data from {min_lat}, {min_lon} to {max_lat}, {max_lon}")
+            UI.vprint(
+                1,
+                f"    Downloading OSM data from {min_lat},{min_lon} "
+                f"to {max_lat},{max_lon}",
+            )
+            # get_overpass_data already retries empty responses.
             response = OSM.get_overpass_data(buildings_and_trees_tags, bbox)
             if response:
                 file_name = os.path.join(
                     scenproc_osm_dir,
-                    f"scenproc_osm_data{i}_{j}.osm"
+                    f"scenproc_osm_data{i}_{j}.osm",
                 )
                 with open(file_name, "wb") as f:
                     f.write(response)
-                print("Download successful")
+                UI.vprint(1, "    Download successful")
             else:
-                print(f"Warning: failed to download OSM data for bbox {bbox}, skipping.")
-
+                UI.vprint(
+                    1,
+                    f"    Warning: failed to download OSM data for bbox "
+                    f"{bbox}, skipping.",
+                )
             min_lat = max_lat
             j += 1
-
         min_lon = max_lon
         i += 1
 
@@ -399,19 +618,6 @@ def include_roads(vector_map, tile, apt_array, apt_area):
         )
         if UI.red_flag:
             return 0
-    # Hack (23/02/2024 : seems better without actually, keep it just in case)
-    if False and not road_network_flat.is_empty:
-        road_network_flat = road_network_flat.difference(road_network_banked)
-        road_network_flat = road_network_flat.difference(
-            VECT.improved_buffer(apt_area, 15, 0, 0)
-        ).simplify(0.00001)
-        UI.vprint(
-            1,
-            "    * Encoding the remaining primary road network as linestrings.",
-        )
-        vector_map.encode_MultiLineString(
-            road_network_flat, tile.dem.alt_vec, "DUMMY", check=True
-        )
     return 1
 
 
@@ -645,53 +851,6 @@ def include_water(vector_map, tile):
 
 
 ################################################################################
-# def include_buildings(vector_map, tile):
-#     # should be all revisited
-#     UI.vprint(0, "-> Dealing with buildings")
-#     building_layer = OSM.OSM_layer()
-#     queries = []  #'way["building"="yes"]']
-#     tags_of_interest = []
-#     if not OSM.OSM_queries_to_OSM_layer(
-#         queries,
-#         building_layer,
-#         tile.lat,
-#         tile.lon,
-#         tags_of_interest,
-#         cached_suffix="buildings",
-#     ):
-#         return 0
-#     for (i, j) in itertools.product(range(1), range(1)):
-#         print("    Obtaining part ", 4 * i + j, " of OSM data for " + tag)
-#         response = get_overpass_data(
-#             tag,
-#             (lat + i / 4, lon + j / 4, lat + (i + 1) / 4, lon + (j + 1) / 4),
-#             "FR",
-#         )
-#         if UI.red_flag:
-#             return 0
-#         if response[0] != "ok":
-#             print("    Error while trying to obtain ", query, ", exiting.")
-#             return 0
-#         building_layer.update_dicosm(response[1], tags_of_interest)
-#     building_area = OSM.OSM_to_MultiPolygon(building_layer, lat, lon)
-#     try:
-#         (idx_building, dico_building) = MultiPolygon_to_Indexed_Polygons(
-#             building_area, merge_overlappings=True
-#         )
-#     except:
-#         return 0
-#     UI.vprint(2, "Number of building Multipolygons :", len(dico_pol_building))
-#     vector_map.encode_MultiPolygon(
-#         dico_building,
-#         dem.alt_vec,
-#         "WATER",
-#         area_limit=min_area / 10000,
-#         check=True,
-#     )
-#     return 1
-
-
-################################################################################
 def include_patches(vector_map, tile):
     def tanh_profile(alpha, x):
         return (numpy.tanh((x - 0.5) * alpha) / numpy.tanh(0.5 * alpha) + 1) / 2
@@ -725,11 +884,6 @@ def include_patches(vector_map, tile):
         dn = patch_layer.dicosmn
         df = patch_layer.dicosmfirst
         dt = patch_layer.dicosmtags
-        # reorganize them so that untagged dummy ways are treated last (due to
-        # altitude being first done kept for all)
-        # waylist=list(set(dw).intersection(df['w']).intersection(dt['w']))+
-        # list(set(dw).intersection(df['w']).difference(dt['w']))
-        # HACK
         waylist = tuple(df["w"].intersection(dt["w"])) + tuple(
             df["w"].difference(dt["w"])
         )

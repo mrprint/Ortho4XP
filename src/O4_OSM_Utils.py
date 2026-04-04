@@ -3,11 +3,81 @@ import time
 import io
 import bz2
 import random
-import requests
 import numpy
+import hashlib
+import threading
 from shapely import geometry, ops
 import O4_UI_Utils as UI
 import O4_File_Names as FNAMES
+
+try:
+    import httpx
+    _has_httpx = True
+except ImportError:           # pragma: no cover — httpx required, warn once
+    import requests as _requests_fallback  # type: ignore[import]
+    _has_httpx = False
+    UI.lvprint(0, "WARNING: httpx not installed, falling back to requests "
+                  "(no HTTP/2). Install with: pip install 'httpx[http2]'")
+
+# -------------------------------------------------------------------
+# HTTP CLIENT (persistent)
+# -------------------------------------------------------------------
+_httpx_client = None
+_httpx_lock = threading.Lock()
+
+def _get_httpx_client():
+    global _httpx_client
+    if _httpx_client is None:
+        with _httpx_lock:
+            if _httpx_client is None:
+                _httpx_client = httpx.Client(
+                    http2=True,
+                    timeout=60.0,
+                    follow_redirects=True,
+                    trust_env=False,
+                    limits=httpx.Limits(
+                        max_connections=20,
+                        max_keepalive_connections=10,
+                    ),
+                    headers={
+                        "User-Agent": "Ortho4XP-ESP",
+                        "Accept-Encoding": "gzip, deflate, br",
+                    }
+                )
+    return _httpx_client
+
+
+# -------------------------------------------------------------------
+# REQUESTS fallback (pooling)
+# -------------------------------------------------------------------
+_requests_session = None
+
+def _get_requests_session():
+    global _requests_session
+    if _requests_session is None:
+        _requests_session = _requests_fallback.Session()
+    return _requests_session
+
+
+# -------------------------------------------------------------------
+# SERVER STATE (rate limit)
+# -------------------------------------------------------------------
+_server_state = {}
+_server_lock = threading.Lock()
+
+MIN_REQUEST_INTERVAL = 1.0
+MAX_COOLDOWN = 60
+
+def _get_server_state(url):
+    with _server_lock:
+        if url not in _server_state:
+            _server_state[url] = {
+                "last_request": 0.0,
+                "cooldown_until": 0.0,
+                "fail_count": 0,
+            }
+        return _server_state[url]
+
 
 overpass_servers = {
     "DE": "https://overpass-api.de/api/interpreter",
@@ -16,9 +86,63 @@ overpass_servers = {
     "RU2": "https://overpass.openstreetmap.ru/api/interpreter",
     "JP": "https://overpass.osm.jp/api/interpreter"
 }
-# KU server does not rate limit as of 2024-07-08
-overpass_server_choice = "KU"
-max_osm_tentatives = 8
+overpass_server_choice = "DE"
+max_osm_tentatives = 6
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _is_empty_osm(content: bytes) -> bool:
+    """
+    Return True when the Overpass response is structurally valid XML but
+    contains no actual map data (no <node>, <way>, or <relation> elements).
+
+    This happens when the server is under load and returns a response like:
+
+        <?xml version="1.0" encoding="UTF-8"?>
+        <osm version="0.6" generator="Overpass API ...">
+        <note>...</note>
+        <meta osm_base="..."/>
+        </osm>
+
+    Such a response must be retried rather than written to disk.
+    """
+    return (
+        b"<node" not in content
+        and b"<way" not in content
+        and b"<relation" not in content
+    )
+
+
+def _is_valid_osm_file(path):
+    try:
+        if path.endswith(".bz2"):
+            with bz2.open(path, "rb") as f:
+                content = f.read(2000) + f.read()[-200:]
+        else:
+            with open(path, "rb") as f:
+                content = f.read(2000) + f.read()[-200:]
+
+        return (
+            b"<osm" in content[:200]
+            and (b"</osm>" in content[-50:] or b"</OSM>" in content[-50:])
+            and not _is_empty_osm(content)
+        )
+    except:
+        return False
+
+
+def _make_httpx_client() -> "httpx.Client":
+    """Return a reusable synchronous httpx client with HTTP/2 enabled."""
+    return httpx.Client(
+        http2=True,
+        timeout=60.0,
+        follow_redirects=True,
+        # Do NOT pick up system proxy settings — overpass servers are public.
+        trust_env=False,
+    )
+
 
 ################################################################################
 class OSM_layer:
@@ -51,8 +175,8 @@ class OSM_layer:
 
     def update_dicosm(self, osm_input, input_tags=None, target_tags=None):
         # input_tags (dict or None) are the input query tags (per osm type)
-        # target_tags (dict or None) are the the tags which should be kept 
-        # (per osm type) It is expected that if not None the target_tags 
+        # target_tags (dict or None) are the the tags which should be kept
+        # (per osm type) It is expected that if not None the target_tags
         # contains the input_tags
         initnodes = len(self.dicosmn)
         initways = len(self.dicosmfirst["w"])
@@ -174,7 +298,7 @@ class OSM_layer:
                         self.dicosmtags[osmtype][osmid] = {items[1]: items[3]}
                     else:
                         self.dicosmtags[osmtype][osmid][items[1]] = items[3]
-                    # If so, do we need to declare this osmid as a first catch, 
+                    # If so, do we need to declare this osmid as a first catch,
                     # not one only brought with as a child
                     if input_tags and (
                         ((items[1], "") in input_tags[osmtype])
@@ -293,7 +417,7 @@ class OSM_layer:
             UI.vprint(1, "    Could not open", filename, "for writing.")
             return 0
         fout.write(
-            '<?xml version="1.0" encoding="UTF-8"?>\n<osm version="0.6" ' + 
+            '<?xml version="1.0" encoding="UTF-8"?>\n<osm version="0.6" ' +
             'generator="Ortho4XP">\n'
         )
         if not len(self.dicosmfirst["n"]):
@@ -400,7 +524,7 @@ def OSM_queries_to_OSM_layer(
     server_code=None,
     cached_suffix="",
 ):
-    # this one is a bit complicated by a few checks of existing cached data 
+    # this one is a bit complicated by a few checks of existing cached data
     # which had different filenames is versions prior to 1.30
     target_tags = {"n": [], "w": [], "r": []}
     input_tags = {"n": [], "w": [], "r": []}
@@ -423,10 +547,13 @@ def OSM_queries_to_OSM_layer(
                         target_tags[osm_type].append(tag)
     cached_data_filename = FNAMES.osm_cached(lat, lon, cached_suffix)
     if cached_suffix and os.path.isfile(cached_data_filename):
-        UI.vprint(1, "    * Recycling OSM data from", cached_data_filename)
-        return osm_layer.update_dicosm(
-            cached_data_filename, input_tags, target_tags
-        )
+        if _is_valid_osm_file(cached_data_filename):
+            UI.vprint(1, "    * Recycling OSM data from", cached_data_filename)
+            return osm_layer.update_dicosm(
+                cached_data_filename, input_tags, target_tags
+            )
+        else:
+            UI.vprint(1, "    * Cached OSM invalid → redownloading")
     for query in queries:
         # look first for cached data (old scheme)
         if isinstance(query, str):
@@ -512,84 +639,116 @@ def OSM_query_to_OSM_layer(
     return 1
 
 ################################################################################
-def get_overpass_data(query, bbox, server_code=None):
+def get_overpass_data(
+    query,
+    bbox,
+    server_code=None,
+    *,
+    client: "httpx.Client | None" = None,
+) -> bytes | int:
+
     tentative = 1
-    while True:
-        s = requests.Session()
-        true_server_code = server_code
-        if not server_code:
-            true_server_code = (
-                random.choice(list(overpass_servers.keys()))
-                if overpass_server_choice == "random"
-                else overpass_server_choice
-            )
-        base_url = overpass_servers[true_server_code]
-        if isinstance(query, str):
-            overpass_query = query + str(bbox) + ";"
-        else:  # query is a tuple
-            overpass_query = "".join([x + str(bbox) + ";" for x in query])
+
+    if isinstance(query, str):
+        overpass_query = query + str(bbox) + ";"
+    else:
+        overpass_query = "".join([x + str(bbox) + ";" for x in query])
+
+    def _choose_server():
+        servers = list(overpass_servers.values())
+
+        def score(url):
+            s = _get_server_state(url)
+            return (s["cooldown_until"], s["fail_count"])
+
+        servers.sort(key=score)
+        return servers[0]
+
+    def _do_request(base_url):
         url = base_url + "?data=(" + overpass_query + ");(._;>>;);out meta;"
-        UI.vprint(3, url)
-        try:
+
+        if _has_httpx:
+            c = _get_httpx_client()
+            r = c.get(url)
+            return r.status_code, r.content
+        else:
+            s = _get_requests_session()
             r = s.get(url, timeout=60)
-            UI.vprint(3, "OSM response status :", r)
-            if "200" in str(r):
-                if (
-                    b"</osm>" not in r.content[-10:]
-                    and b"</OSM>" not in r.content[-10:]
-                ):
-                    UI.vprint(
-                        1,
-                        "        OSM server",
-                        true_server_code,
-                        "sent a corrupted answer (no closing </osm> tag in ",
-                        "answer), new tentative in",
-                        2 ** tentative,
-                        "sec...",
-                    )
-                elif len(r.content) <= 1000 and b"error" in r.content:
-                    UI.vprint(
-                        1,
-                        "        OSM server",
-                        true_server_code,
-                        "sent us an error code for the data (data too big ?), ",
-                        "new tentative in",
-                        2 ** tentative,
-                        "sec...",
-                    )
+            return r.status_code, r.content
+
+    while True:
+        base_url = _choose_server()
+        state = _get_server_state(base_url)
+
+        now = time.time()
+
+        if now < state["cooldown_until"]:
+            wait = state["cooldown_until"] - now
+            UI.vprint(2, f"        Waiting {wait:.1f}s [{base_url}]")
+            time.sleep(wait)
+
+        delta = time.time() - state["last_request"]
+        if delta < MIN_REQUEST_INTERVAL:
+            time.sleep(MIN_REQUEST_INTERVAL - delta)
+
+        time.sleep(random.uniform(0.05, 0.15))
+        state["last_request"] = time.time()
+
+        try:
+            status_code, content = _do_request(base_url)
+
+            UI.vprint(2, f"        [{base_url}] HTTP {status_code}")
+
+            if status_code == 200:
+
+                if _is_empty_osm(content):
+                    state["fail_count"] += 1
+                    wait = min(10, 1.5 ** tentative)
+                    UI.vprint(1, f"        EMPTY OSM → retry in {wait}s")
+                    time.sleep(wait)
+
                 else:
-                    break
-            else:
-                UI.vprint(
-                    1,
-                    "        OSM server",
-                    true_server_code,
-                    "rejected our query, new tentative in",
-                    2 ** tentative,
-                    "sec...",
+                    state["fail_count"] = 0
+                    return content
+
+            elif status_code == 429:
+                state["fail_count"] += 1
+                cooldown = min(MAX_COOLDOWN, 3 * state["fail_count"])
+                state["cooldown_until"] = time.time() + cooldown
+
+                UI.vprint(1,
+                    f"        HTTP 429 [{base_url}] → cooldown {cooldown}s"
                 )
-        except:
-            UI.vprint(
-                1,
-                "        OSM server",
-                true_server_code,
-                "was too busy, new tentative in",
-                2 ** tentative,
-                "sec...",
+
+            elif status_code >= 500:
+                state["fail_count"] += 1
+                wait = min(20, 1.5 ** tentative)
+
+                UI.vprint(1,
+                    f"        HTTP {status_code} → retry in {wait}s"
+                )
+                time.sleep(wait)
+
+            else:
+                return 0
+
+        except Exception as e:
+            state["fail_count"] += 1
+            wait = min(20, 1.5 ** tentative)
+
+            UI.vprint(1,
+                f"        Exception [{base_url}] {e} → retry in {wait}s"
             )
-            true_server_code = (
-                random.choice(list(overpass_servers.keys()))
-                if overpass_server_choice == "random"
-                else overpass_server_choice
-            )
-            UI.vprint(1, "        Trying different OSM server", true_server_code)
+
+            time.sleep(wait)
+
         if tentative >= max_osm_tentatives:
             return 0
+
         if UI.red_flag:
             return 0
-        time.sleep(2 ** tentative)
+
         tentative += 1
-    return r.content
 
 ################################################################################
 def OSM_to_MultiLineString(
